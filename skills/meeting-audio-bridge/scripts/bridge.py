@@ -81,9 +81,16 @@ def doctor(fixture=None):
 
 
 def make_plan(mode, headphones, microphone, forward='BlackHole 2ch',
-              return_bus='BlackHole 16ch', speaker='local'):
+              return_bus='BlackHole 16ch', speaker=None, mixer=None,
+              mix_to_a=None, mix_to_b=None):
+    if mode == 'mix':
+        return make_mix_plan(headphones, microphone, forward, return_bus,
+                             speaker, mixer, mix_to_a, mix_to_b)
+    if any(value is not None for value in (mixer, mix_to_a, mix_to_b)):
+        raise ValueError('Mixer options require --mode mix')
+    speaker = 'local' if speaker is None else speaker
     if mode not in ('listen', 'two-way'):
-        raise ValueError('Supported modes: listen, two-way. Simultaneous speech needs a mixer.')
+        raise ValueError('Supported modes: listen, two-way, mix (requires a mixer).')
     if speaker not in ('local', 'colleague'):
         raise ValueError('Speaker must be local or colleague')
     if mode == 'listen' and speaker != 'local':
@@ -152,6 +159,157 @@ def make_plan(mode, headphones, microphone, forward='BlackHole 2ch',
     }
 
 
+def make_mix_plan(headphones, microphone, forward, return_bus, speaker,
+                  mixer, mix_to_a, mix_to_b):
+    """Plan two mix-minus outputs for an external mixer; never run audio."""
+    if speaker not in (None, 'both'):
+        raise ValueError('Mix mode uses both speakers; omit --speaker or use both')
+    if mixer == 'native':
+        return make_native_plan(headphones, microphone, forward, return_bus, mix_to_a, mix_to_b)
+    if mixer not in ('loopback', 'ladiocast'):
+        raise ValueError('Mix mode requires --mixer native, loopback or ladiocast')
+    if mixer == 'ladiocast' and (mix_to_a is None or mix_to_b is None):
+        raise ValueError('LadioCast requires two independent output devices: '
+                         '--mix-to-a and --mix-to-b')
+    # Reuse the existing bus and physical-endpoint checks, including whitespace handling.
+    plan = make_plan('two-way', headphones, microphone, forward, return_bus)
+    headphones = plan['multi_outputs'][0]['members'][0]
+    microphone = plan['settings']['A']['input']
+    forward, return_bus = plan['required_virtual_devices']
+    mixed = [mix_to_a if mix_to_a is not None else 'Bridge Mix to A',
+             mix_to_b if mix_to_b is not None else 'Bridge Mix to B']
+    if any(not isinstance(name, str) or not name.strip() or
+           any(ord(char) < 32 for char in name) for name in mixed):
+        raise ValueError('Use non-empty mix device names without control characters')
+    mix_to_a, mix_to_b = [name.strip() for name in mixed]
+    buses = [forward, return_bus, mix_to_a, mix_to_b]
+    if len({name.casefold() for name in buses}) != 4:
+        raise ValueError('Raw and mixed buses must be four independent devices')
+    reserved = {'a.input', 'a.output', 'b.input', 'b.output', 'local.mic', 'headphones'}
+    if set(map(str.casefold, buses + [headphones, microphone])) & reserved:
+        raise ValueError('Device names must not collide with signal graph node names')
+    endpoints = {headphones.casefold(), microphone.casefold(),
+                 'bridge a to b', 'bridge b to a'}
+    if {mix_to_a.casefold(), mix_to_b.casefold()} & endpoints:
+        raise ValueError('Mixed outputs must not reuse physical or multi-output devices')
+
+    def output(device, remote, excluded):
+        return {
+            'device': device, 'channels': [1, 2],
+            'sources': [
+                {'device': microphone, 'gain_db': -9,
+                 'channel_map': [[1, 1], [1, 2]]},
+                {'device': remote, 'gain_db': -9,
+                 'channel_map': [[1, 1], [2, 2]]},
+            ],
+            'excluded_sources': [excluded],
+            'monitor': None,
+        }
+
+    mute_both = [{'app': 'A', 'set_muted': True}, {'app': 'B', 'set_muted': True}]
+    plan.update({
+        'mode': 'mix', 'speaker': 'both',
+        'required_virtual_devices': buses,
+        'mixer': {
+            'backend': mixer, 'status': 'requires_configuration',
+            'outputs': [output(mix_to_a, return_bus, forward),
+                        output(mix_to_b, forward, return_bus)],
+            'output_device_provisioning': 'create_in_loopback' if mixer == 'loopback'
+                                          else 'supply_independent_loopback_devices',
+            'recording': False, 'network_streaming': False,
+        },
+        'signal_edges': [
+            ['A.output', forward], ['B.output', return_bus],
+            ['A.output', 'headphones'], ['B.output', 'headphones'],
+            ['local.mic', mix_to_a], [return_bus, mix_to_a], [mix_to_a, 'A.input'],
+            ['local.mic', mix_to_b], [forward, mix_to_b], [mix_to_b, 'B.input'],
+        ],
+        'operations': {
+            'enable_mix': mute_both + [
+                {'app': 'A', 'set_input': mix_to_a},
+                {'app': 'B', 'set_input': mix_to_b},
+            ],
+            # B already receives the local mic. A stays private; its output still reaches B.
+            'internal_discussion': [{'app': 'A', 'set_muted': True}],
+            'resume_mix': mute_both + [
+                {'app': 'A', 'set_input': mix_to_a},
+                {'app': 'B', 'set_input': mix_to_b},
+            ],
+            'exit_to_switching': mute_both + [
+                {'app': 'A', 'set_input': microphone},
+                {'app': 'B', 'set_input': forward},
+            ],
+        },
+        'limitations': [
+            'Plan only: no mixer is installed, started or configured by this command.',
+            'Four independent raw/mixed devices are required; names do not prove independence.',
+            'The microphone uses channel 1 duplicated to stereo; verify the real device mapping.',
+            'Start each source at -9 dB and check simultaneous speech for clipping and processing artifacts.',
+            'Headphones are monitored by the two multi-output devices; mixer monitors stay off.',
+            'Both clients must be unmuted under test/speech authorization for full three-way speech.',
+            'In mix mode, muting B also prevents the local microphone from reaching B.',
+            'Local meters do not verify network transmission, echo isolation or remote intelligibility.',
+        ],
+    })
+    plan['settings']['A']['input'] = mix_to_a
+    plan['settings']['B'].update(input=mix_to_b, start_muted=True)
+    return plan
+
+
+
+def make_native_plan(headphones, microphone, forward, return_bus, mix_to_a, mix_to_b):
+    """Application taps supply raw audio; only two mixed virtual outputs are needed."""
+    if mix_to_a is None or mix_to_b is None:
+        raise ValueError('Native mixer requires --mix-to-a and --mix-to-b')
+    # Validate actual destination names with the existing two-bus endpoint checks.
+    checked = make_plan('two-way', headphones, microphone, mix_to_b, mix_to_a)
+    headphones = checked['multi_outputs'][0]['members'][0]
+    microphone = checked['settings']['A']['input']
+    mix_to_b, mix_to_a = checked['required_virtual_devices']
+    reserved = {'a.input', 'a.output', 'b.input', 'b.output', 'local.mic', 'headphones'}
+    if set(map(str.casefold, [headphones, microphone, mix_to_a, mix_to_b])) & reserved:
+        raise ValueError('Device names conflict with signal graph node names')
+    muted = [{'app': 'A', 'set_muted': True}, {'app': 'B', 'set_muted': True}]
+    enable = muted + [{'app': side, 'set_output': headphones} for side in ('A', 'B')] + [
+        {'app': 'A', 'set_input': mix_to_a}, {'app': 'B', 'set_input': mix_to_b}]
+    return {
+        'schema_version': 1, 'status': 'planned_only', 'mode': 'mix', 'speaker': 'both',
+        'end_to_end': 'untested', 'required_virtual_devices': [mix_to_a, mix_to_b],
+        'virtual_channels': [1, 2], 'multi_outputs': [],
+        'settings': {
+            'A': {'app': '腾讯会议', 'input': mix_to_a, 'output': headphones, 'start_muted': True},
+            'B': {'app': '钉钉', 'input': mix_to_b, 'output': headphones, 'start_muted': True},
+        },
+        'mixer': {
+            'backend': 'native', 'status': 'experimental_requires_configuration',
+            'capture': 'selected_coreaudio_process_taps', 'process_selection': 'required_in_app',
+            'outputs': [
+                {'device': mix_to_a, 'channels': [1, 2], 'sources': ['local.mic', 'B.output'],
+                 'excluded_sources': ['A.output'], 'source_gain_db': -9},
+                {'device': mix_to_b, 'channels': [1, 2], 'sources': ['local.mic', 'A.output'],
+                 'excluded_sources': ['B.output'], 'source_gain_db': -9},
+            ],
+            'recording': False, 'network_streaming': False,
+        },
+        'signal_edges': [
+            ['A.output', 'headphones'], ['B.output', 'headphones'],
+            ['local.mic', mix_to_a], ['B.output', mix_to_a], [mix_to_a, 'A.input'],
+            ['local.mic', mix_to_b], ['A.output', mix_to_b], [mix_to_b, 'B.input'],
+        ],
+        'operations': {'enable_mix': enable, 'resume_mix': enable,
+                       'internal_discussion': [{'app': 'A', 'set_muted': True}]},
+        'limitations': [
+            'Prototype plan only; app build, permissions and per-client capture are unverified.',
+            'Both clients must output directly to physical headphones, never old Bridge multi-outputs.',
+            'Read and save existing settings before changing either client; keep both muted.',
+            'Only two independent virtual destinations are needed; taps replace raw buses.',
+            'Select the actual audio process of each client; no global system-audio fallback.',
+            'Restore both input and output selections before returning to the old switching mode.',
+            'No automatic microphone opening, driver installation, recording or remote verification.',
+        ],
+    }
+
+
 def emit(data, output=None):
     rendered = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
     if output:
@@ -169,8 +327,11 @@ def main(argv=None):
     inspect.add_argument('--fixture', help='Parse saved system_profiler JSON instead of live devices')
     inspect.add_argument('--output', help='Create a JSON report; refuses overwrite')
     plan = commands.add_parser('plan', help='Generate JSON instructions; does not configure devices')
-    plan.add_argument('--mode', choices=['listen', 'two-way'], default='two-way')
-    plan.add_argument('--speaker', choices=['local', 'colleague'], default='local')
+    plan.add_argument('--mode', choices=['listen', 'two-way', 'mix'], default='two-way')
+    plan.add_argument('--speaker', choices=['local', 'colleague', 'both'])
+    plan.add_argument('--mixer', choices=['native', 'loopback', 'ladiocast'])
+    plan.add_argument('--mix-to-a', help='Independent mixed microphone device for A')
+    plan.add_argument('--mix-to-b', help='Independent mixed microphone device for B')
     plan.add_argument('--headphones', required=True)
     plan.add_argument('--microphone', required=True)
     plan.add_argument('--forward', default='BlackHole 2ch')
@@ -182,7 +343,8 @@ def main(argv=None):
             result = doctor(args.fixture)
         else:
             result = make_plan(args.mode, args.headphones, args.microphone,
-                               args.forward, args.return_bus, args.speaker)
+                               args.forward, args.return_bus, args.speaker,
+                               args.mixer, args.mix_to_a, args.mix_to_b)
         emit(result, args.output)
         return 0 if result['status'] in ('observed', 'planned_only') else 2
     except (OSError, ValueError) as exc:

@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 sessions/
 .venv/
+native-mixer/build/
+
+# Project-local installation; canonical skill lives in skills/.
+/.agents/skills/meeting-audio-bridge/
